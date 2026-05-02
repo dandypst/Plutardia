@@ -22,10 +22,9 @@ import CONFIG from "./config.js";
 import logger from "./logger.js";
 
 // ── Bot state ─────────────────────────────────────────────────
-let isRunning        = false;
-let autoExec         = false;
-let scanTimer        = null;
-let _liveOpportunities = []; // shared buffer: scanner → agent
+let isRunning = false;
+let autoExec  = false;
+let scanTimer = null;
 
 // ── Banner ────────────────────────────────────────────────────
 logger.banner("PLUTARDIA v1.0");
@@ -52,9 +51,6 @@ async function runScan() {
 
   const result = await scan(CONFIG.inputAmountUsdc);
 
-  // Update live buffer for agent to read
-  _liveOpportunities = result.profitable;
-
   for (const opp of result.profitable) {
     state.addOpportunity(opp);
     notifyArbFound(opp).catch(() => {});
@@ -69,7 +65,7 @@ async function runScan() {
       }
     }
   }
-  // Note: when agentEnabled=true, execution is handled by agent.js on its own interval
+  // Note: when agentEnabled=true, agent screens and executes autonomously via its own interval
 }
 
 // ── Start / stop ──────────────────────────────────────────────
@@ -198,7 +194,7 @@ function prompt() {
         }, null, 4).replace(/\n/g, "\n  "));
       } else if (cmd === "agent") {
         const s = getAgentStats();
-        logger.info(`[AGENT] model=${s.model} | interval=${s.intervalS}s | cycles=${s.cycles} | exec=${s.executed} | skipped=${s.skipped}`);
+        logger.info(`[AGENT] model=${s.model} | interval=${s.intervalS}s | cycles=${s.cycles} | toolCalls=${s.toolCalls} | executed=${s.executed} | enabled=${s.enabled}`);
       } else if (cmd.startsWith("chat ")) {
         const userInput = input.trim().slice(5);
         logger.info("[AGENT] Sending to agent...");
