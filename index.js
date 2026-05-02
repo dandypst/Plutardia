@@ -81,8 +81,8 @@ function startBot() {
   runScan();
   scanTimer = setInterval(runScan, CONFIG.scanIntervalMs);
 
-  // Start AI agent on its own interval
-  startAgent(() => _liveOpportunities);
+  // Start AI agent on its own interval (fully autonomous)
+  startAgent();
 }
 
 function stopBot() {

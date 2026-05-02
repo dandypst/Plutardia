@@ -1,269 +1,215 @@
-// agent.js — AI Agent reasoning loop (OpenRouter)
-// ReAct pattern: Observe market data → Reason → Decide → Act
-// Runs on configurable interval independently from the scanner
+// agent.js — Autonomous ReAct agent with tool calling (OpenRouter)
+// Full loop: Observe → Reason → Tool call → Observe result → Reason → Act
+// Agent can: screen markets, discover routes, simulate, compare prices, execute
 
 import axios from "axios";
 import CONFIG from "./config.js";
 import logger from "./logger.js";
-import { screenPools } from "./tools/dlmm.js";
-import { getTokenPrice, MINT_ADDRESSES } from "./tools/jupiter.js";
-import { getWalletStatus } from "./tools/wallet.js";
+import { TOOL_DEFINITIONS } from "./tools/definitions.js";
+import { dispatchTool } from "./tools/tool_executor.js";
 import { state } from "./state.js";
-import { executeArb } from "./executor.js";
 
 const OPENROUTER_API = "https://openrouter.ai/api/v1/chat/completions";
 
-// ── Session memory (last N exchanges, Meridian pattern) ───────
+// ── Session memory (Meridian pattern) ────────────────────────
 const _sessionHistory = [];
-const MAX_HISTORY     = 10;
+const MAX_HISTORY     = 20;
 
 // ── Agent stats ───────────────────────────────────────────────
-let _cycleCount   = 0;
+let _cycleCount    = 0;
+let _toolCallCount = 0;
 let _execDecisions = 0;
-let _skipDecisions = 0;
-let _agentTimer   = null;
+let _agentTimer    = null;
+let _isRunning     = false;
 
-// ── Call OpenRouter API ───────────────────────────────────────
-async function callOpenRouter(messages, systemPrompt) {
-  if (!CONFIG.openRouterApiKey) {
-    throw new Error("OPENROUTER_API_KEY not set — agent disabled");
-  }
+// ── System prompt ─────────────────────────────────────────────
+function buildSystemPrompt() {
+  return `You are Plutardia, an autonomous Solana arbitrage agent.
+
+Your mission: actively screen Meteora DAMM v2 and DLMM pools, discover price discrepancies, build arbitrage routes, simulate profitability, and execute when conditions are right.
+
+How to operate each cycle:
+1. Call screen_pools() to find active USDC-paired pools
+2. Call compare_pool_prices() on promising pairs to detect price gaps
+3. Call simulate_route() to verify profitability of any discovered route
+4. Call get_token_info() to assess risk (avoid unverified/suspicious tokens)
+5. Call get_wallet_status() to confirm capital availability
+6. Call execute_arb() only when: profitable + verified + confident
+
+Key arbitrage philosophy (from observed on-chain txs):
+- Tiny USDC input (e.g. $0.20) -> mid-token via DAMM v2 (over-inflated price) -> back to USDC via DLMM (market price) = massive return
+- Look for tokens where DAMM v2 price >> DLMM price
+- 2-hop: USDC -> TOKEN -> USDC
+- 3-hop: USDC -> TOKEN_A -> TOKEN_B -> USDC
+
+Risk rules (STRICT):
+- Never execute on unverified tokens without strong reasoning
+- Never execute if SOL balance < 0.005 (need fees)
+- Never execute if price impact > ${CONFIG.maxSlippagePct}% per leg
+- Never execute if simulate_route shows loss
+- Skip pools with TVL < $${CONFIG.minTvl}
+- Be especially suspicious of extremely high ROI (>1000x) - could be honeypot
+
+Config:
+- Min profit to execute: $${CONFIG.minProfitUsd}
+- Min ROI: ${CONFIG.minRoiMultiplier}x
+- Input per trade: $${CONFIG.inputAmountUsdc} USDC
+- Mode: ${CONFIG.dryRun ? "DRY RUN (safe - no real money)" : "LIVE TRADING"}
+
+Think step by step. Use tools to gather real data before deciding. Be autonomous but conservative.`;
+}
+
+// ── Call OpenRouter with tool support ─────────────────────────
+async function callOpenRouter(messages) {
+  if (!CONFIG.openRouterApiKey) throw new Error("OPENROUTER_API_KEY not set");
 
   const resp = await axios.post(
     OPENROUTER_API,
     {
-      model:      CONFIG.agentModel,
-      max_tokens: CONFIG.agentMaxTokens,
+      model:       CONFIG.agentModel,
+      max_tokens:  CONFIG.agentMaxTokens,
+      tools:       TOOL_DEFINITIONS,
+      tool_choice: "auto",
       messages: [
-        { role: "system", content: systemPrompt },
+        { role: "system", content: buildSystemPrompt() },
         ...messages,
       ],
     },
     {
       headers: {
-        "Authorization":  `Bearer ${CONFIG.openRouterApiKey}`,
-        "Content-Type":   "application/json",
-        "HTTP-Referer":   "https://github.com/plutardia",
-        "X-Title":        "Plutardia Arb Bot",
+        "Authorization": `Bearer ${CONFIG.openRouterApiKey}`,
+        "Content-Type":  "application/json",
+        "HTTP-Referer":  "https://github.com/plutardia",
+        "X-Title":       "Plutardia Arb Bot",
       },
-      timeout: 20_000,
+      timeout: 30_000,
     }
   );
 
-  return resp.data.choices?.[0]?.message?.content || "";
+  return resp.data.choices?.[0]?.message;
 }
 
-// ── Build system prompt ───────────────────────────────────────
-function buildSystemPrompt(walletStatus) {
-  return `You are Plutardia, an autonomous Solana arbitrage agent.
-Your job is to analyze market data and decide whether to execute arbitrage opportunities.
+// ── ReAct loop: keeps running until agent stops calling tools ─
+async function reactLoop(initialUserMessage, maxIterations = 10) {
+  const messages = [..._sessionHistory, { role: "user", content: initialUserMessage }];
+  let iterations = 0;
+  let finalText  = "";
 
-Current wallet:
-- SOL: ${walletStatus.sol.toFixed(4)}
-- USDC: $${walletStatus.usdc.toFixed(2)}
-- Mode: ${CONFIG.dryRun ? "DRY RUN (simulation)" : "LIVE TRADING"}
+  while (iterations < maxIterations) {
+    iterations++;
 
-Bot config:
-- Min profit threshold: $${CONFIG.minProfitUsd}
-- Min ROI multiplier: ${CONFIG.minRoiMultiplier}x
-- Max slippage: ${CONFIG.maxSlippagePct}%
-- Input per trade: $${CONFIG.inputAmountUsdc} USDC
+    const assistantMsg = await callOpenRouter(messages);
+    if (!assistantMsg) break;
 
-You will receive:
-1. Live pool screening data (TVL, volume, fee ratios)
-2. Current arbitrage opportunities found by the scanner
-3. Recent execution history
+    messages.push(assistantMsg);
 
-Respond ONLY with a valid JSON object in this exact format:
-{
-  "decision": "EXECUTE" | "SKIP" | "WAIT",
-  "confidence": <number 0-100>,
-  "reasoning": "<brief explanation>",
-  "targets": [<list of routeNames to execute, empty if SKIP/WAIT>],
-  "warnings": ["<any risk flags>"]
-}
+    // No tool calls = agent finished reasoning
+    if (!assistantMsg.tool_calls || assistantMsg.tool_calls.length === 0) {
+      finalText = assistantMsg.content || "";
+      break;
+    }
 
-Decision guide:
-- EXECUTE: High confidence opportunity, good pool conditions, execute now
-- SKIP: Opportunity exists but conditions are risky (low TVL, high impact, suspicious volume)
-- WAIT: No clear opportunity, continue scanning
+    logger.dim(`[AGENT] Iteration ${iterations}: ${assistantMsg.tool_calls.length} tool call(s) — ${assistantMsg.tool_calls.map(t => t.function.name).join(", ")}`);
 
-Be conservative. Prioritize capital preservation over profit.`;
-}
+    // Execute all tool calls (parallel)
+    const toolResults = await Promise.all(
+      assistantMsg.tool_calls.map(async (toolCall) => {
+        _toolCallCount++;
+        const name = toolCall.function.name;
+        let   args = {};
+        try { args = JSON.parse(toolCall.function.arguments || "{}"); } catch {}
 
-// ── Build user message with live market context ───────────────
-async function buildMarketContext(opportunities) {
-  // Fetch pool data
-  const pools = await screenPools({ minTvl: CONFIG.minTvl, limit: 10 }).catch(() => []);
+        const result = await dispatchTool(name, args);
 
-  // Fetch recent exec history
-  const history = state.getProfitableHistory(0).slice(0, 5);
-  const summary = state.summary();
+        return {
+          role:         "tool",
+          tool_call_id: toolCall.id,
+          content:      JSON.stringify(result),
+        };
+      })
+    );
 
-  // Format opportunities
-  const oppSummary = opportunities.length === 0
-    ? "No profitable opportunities found this cycle."
-    : opportunities.map(o =>
-        `- ${o.routeName}: input=$${o.inputUsdc.toFixed(4)}, profit=$${o.profitUsdc.toFixed(2)}, ROI=${o.roiMultiplier.toFixed(0)}x, priceImpact=${o.legs?.map(l => l.priceImpact?.toFixed(2) + "%").join(" → ") || "unknown"}`
-      ).join("\n");
-
-  // Format top pools
-  const poolSummary = pools.slice(0, 5).map(p =>
-    `- ${p.name}: TVL=$${p.tvl.toFixed(0)}, vol24h=$${p.volume24h?.toFixed(0) || "?"}, fee24h=$${p.fee24h?.toFixed(0) || "?"}`
-  ).join("\n");
-
-  // Format history
-  const histSummary = history.length === 0
-    ? "No execution history yet."
-    : history.map(h =>
-        `- ${h.at}: ${h.success ? "SUCCESS" : "FAILED"} profit=$${h.profit?.toFixed(2) || 0}`
-      ).join("\n");
-
-  return `=== CYCLE #${_cycleCount} MARKET SNAPSHOT ===
-
-ARBITRAGE OPPORTUNITIES:
-${oppSummary}
-
-TOP POOLS (by volume):
-${poolSummary}
-
-SESSION STATS:
-- Total execs: ${summary.totalExecs} | Win rate: ${summary.winRate} | Total profit: $${summary.totalProfit}
-
-RECENT HISTORY:
-${histSummary}
-
-Based on this data, what is your decision?`;
-}
-
-// ── Parse agent response safely ───────────────────────────────
-function parseAgentResponse(raw) {
-  try {
-    // Strip markdown fences if present
-    const clean = raw.replace(/```json|```/g, "").trim();
-    return JSON.parse(clean);
-  } catch {
-    logger.warn(`Agent response not valid JSON: ${raw.slice(0, 100)}`);
-    return null;
+    messages.push(...toolResults);
   }
+
+  // Update session history
+  const newMessages = messages.slice(_sessionHistory.length);
+  _sessionHistory.push(...newMessages);
+  while (_sessionHistory.length > MAX_HISTORY) _sessionHistory.splice(0, 1);
+
+  return finalText;
 }
 
 // ── Single agent reasoning cycle ─────────────────────────────
-export async function runAgentCycle(opportunities = []) {
-  if (!CONFIG.agentEnabled) return null;
-  if (!CONFIG.openRouterApiKey) {
-    logger.warn("Agent skipped — OPENROUTER_API_KEY not set");
-    return null;
-  }
+export async function runAgentCycle() {
+  if (!CONFIG.agentEnabled || !CONFIG.openRouterApiKey) return null;
 
   _cycleCount++;
-  logger.exec(`[AGENT] Cycle #${_cycleCount} — reasoning with ${CONFIG.agentModel}...`);
+  const summary = state.summary();
+
+  logger.exec(`[AGENT] ── Cycle #${_cycleCount} ── ${CONFIG.agentModel}`);
+
+  const trigger = `Reasoning cycle #${_cycleCount}. Session stats: ${summary.totalExecs} executions, ${summary.wins} wins, $${summary.totalProfit} profit.
+
+Start by screening pools for USDC-paired opportunities. Look for price discrepancies between DAMM v2 and DLMM pools. Simulate promising routes and execute if profitable and safe.`;
 
   try {
-    const walletStatus  = await getWalletStatus();
-    const systemPrompt  = buildSystemPrompt(walletStatus);
-    const userMessage   = await buildMarketContext(opportunities);
+    const conclusion = await reactLoop(trigger);
 
-    // Add to session history (Meridian pattern)
-    _sessionHistory.push({ role: "user", content: userMessage });
-    if (_sessionHistory.length > MAX_HISTORY * 2) {
-      _sessionHistory.splice(0, 2); // remove oldest exchange
+    if (conclusion) {
+      logger.info(`[AGENT] Cycle #${_cycleCount} done: ${conclusion.slice(0, 200)}`);
     }
 
-    const raw      = await callOpenRouter(_sessionHistory, systemPrompt);
-    const decision = parseAgentResponse(raw);
+    if (conclusion?.toLowerCase().includes("execut")) _execDecisions++;
 
-    // Add assistant response to history
-    _sessionHistory.push({ role: "assistant", content: raw });
-
-    if (!decision) return null;
-
-    logger.exec(`[AGENT] Decision: ${decision.decision} (confidence: ${decision.confidence}%)`);
-    logger.exec(`[AGENT] Reasoning: ${decision.reasoning}`);
-
-    if (decision.warnings?.length) {
-      decision.warnings.forEach(w => logger.warn(`[AGENT] ⚠ ${w}`));
-    }
-
-    // ── Act on decision ───────────────────────────────────────
-    if (
-      decision.decision === "EXECUTE" &&
-      decision.confidence >= CONFIG.agentConfidenceMin &&
-      decision.targets?.length > 0
-    ) {
-      _execDecisions++;
-
-      for (const targetRoute of decision.targets) {
-        const opp = opportunities.find(o => o.routeName === targetRoute);
-        if (!opp) {
-          logger.warn(`[AGENT] Target route not found: ${targetRoute}`);
-          continue;
-        }
-
-        logger.success(`[AGENT] Executing: ${targetRoute}`);
-        const result = await executeArb(opp);
-        if (result) {
-          state.recordExec({ ...result, agentDecision: decision });
-        }
-      }
-    } else if (decision.decision === "SKIP") {
-      _skipDecisions++;
-      logger.dim(`[AGENT] Skipping — ${decision.reasoning}`);
-    } else {
-      logger.dim(`[AGENT] Waiting — ${decision.reasoning}`);
-    }
-
-    return decision;
-
+    return conclusion;
   } catch (e) {
-    logger.error(`[AGENT] Cycle error: ${e.message}`);
+    logger.error(`[AGENT] Cycle #${_cycleCount} failed: ${e.message}`);
     return null;
   }
 }
 
-// ── Chat with agent (free-form, Meridian pattern) ─────────────
+// ── Free-form chat with full tool access ─────────────────────
 export async function chatWithAgent(userInput) {
   if (!CONFIG.openRouterApiKey) {
-    return "Agent not available — OPENROUTER_API_KEY not set.";
+    return "Agent not available — set OPENROUTER_API_KEY in .env";
   }
 
+  logger.dim(`[AGENT] Chat: "${userInput.slice(0, 80)}"`);
+
   try {
-    const walletStatus = await getWalletStatus();
-    const systemPrompt = buildSystemPrompt(walletStatus);
-
-    _sessionHistory.push({ role: "user", content: userInput });
-
-    const raw = await callOpenRouter(_sessionHistory, systemPrompt);
-    _sessionHistory.push({ role: "assistant", content: raw });
-
-    return raw;
+    const reply = await reactLoop(userInput, 8);
+    return reply || "(Agent completed actions but returned no text)";
   } catch (e) {
     return `Agent error: ${e.message}`;
   }
 }
 
-// ── Start agent on interval ────────────────────────────────────
-export function startAgent(getOpportunities) {
+// ── Start / stop ──────────────────────────────────────────────
+export function startAgent() {
   if (!CONFIG.agentEnabled) {
-    logger.warn("Agent disabled (agentEnabled=false in config)");
+    logger.warn("[AGENT] Disabled (agentEnabled=false in config)");
     return;
   }
   if (!CONFIG.openRouterApiKey) {
-    logger.warn("Agent disabled — set OPENROUTER_API_KEY in .env");
+    logger.warn("[AGENT] Disabled — OPENROUTER_API_KEY not set in .env");
     return;
   }
 
+  _isRunning = true;
   const intervalSec = CONFIG.agentIntervalMs / 1000;
-  logger.info(`[AGENT] Started — model: ${CONFIG.agentModel}, interval: ${intervalSec}s`);
+  logger.success(`[AGENT] Started — model: ${CONFIG.agentModel} | interval: ${intervalSec}s`);
 
-  _agentTimer = setInterval(async () => {
-    const opps = getOpportunities();
-    await runAgentCycle(opps);
+  // First cycle after 5s (let connection warm up)
+  setTimeout(() => { if (_isRunning) runAgentCycle(); }, 5000);
+
+  _agentTimer = setInterval(() => {
+    if (_isRunning) runAgentCycle();
   }, CONFIG.agentIntervalMs);
 }
 
-// ── Stop agent ────────────────────────────────────────────────
 export function stopAgent() {
+  _isRunning = false;
   clearInterval(_agentTimer);
   logger.warn("[AGENT] Stopped");
 }
@@ -271,9 +217,10 @@ export function stopAgent() {
 export function getAgentStats() {
   return {
     cycles:    _cycleCount,
+    toolCalls: _toolCallCount,
     executed:  _execDecisions,
-    skipped:   _skipDecisions,
     model:     CONFIG.agentModel,
     intervalS: CONFIG.agentIntervalMs / 1000,
+    enabled:   CONFIG.agentEnabled && !!CONFIG.openRouterApiKey,
   };
 }
