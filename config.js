@@ -75,28 +75,12 @@ export const CONFIG = {
     ORCA_PROGRAM:    "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",
   },
 
-  // ─ Known arb routes to monitor (USDC-based)
-  arbRoutes: [
-    {
-      name:   "USDC→ANX→ANB→USDC",
-      hops:   3,
-      tokens: ["USDC", "ANX", "ANB", "USDC"],
-      pools:  ["DAMM_V2", "DAMM_V2", "DLMM"],
-    },
-    {
-      name:   "USDC→ANB→USDC",
-      hops:   2,
-      tokens: ["USDC", "ANB", "USDC"],
-      pools:  ["DAMM_V2", "DLMM"],
-    },
-    // Generic catch-all routes via Jupiter
-    {
-      name:   "USDC→SOL→mSOL→USDC",
-      hops:   3,
-      tokens: ["USDC", "SOL", "mSOL", "USDC"],
-      pools:  ["ORCA", "RAYDIUM", "DLMM"],
-    },
-  ],
+  // ─ Route discovery
+  baseTokens:        userCfg.baseTokens        ?? ["USDC", "SOL"],  // start/end of arb routes
+  maxHops:           userCfg.maxHops           ?? 3,                // max hops per route (2/3/4)
+  inputAmountUsdc:   userCfg.inputAmountUsdc   ?? 0.2,              // input per arb (in base token units)
+  inputAmountSol:    userCfg.inputAmountSol    ?? 0.001,            // SOL input when base=SOL
+  routeScanLimit:    userCfg.routeScanLimit    ?? 100,              // max pools to pull from Meteora
 };
 
 export default CONFIG;
