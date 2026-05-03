@@ -3,7 +3,9 @@
 // Maps agent tool_call names → actual implementation functions
 
 import { screenPools, getActiveBinPrice, getPoolMeta } from "./dlmm.js";
-import { simulateArbRoute, getTokenPrice, MINT_ADDRESSES } from "./jupiter.js";
+import { simulateArbRoute, getTokenPrice } from "./jupiter.js";
+import { MINT_ADDRESSES, resolveMint, BASE_TOKENS } from "./token_registry.js";
+import { scanAllRoutes } from "./route_builder.js";
 import { getWalletStatus } from "./wallet.js";
 import { state } from "../state.js";
 import { executeArb } from "../executor.js";
@@ -48,41 +50,67 @@ async function tool_get_pool_price({ pool_address }) {
 }
 
 // ── simulate_route ────────────────────────────────────────────
-async function tool_simulate_route({ tokens, input_amount_usdc }) {
+async function tool_simulate_route({ tokens, input_amount }) {
   if (!tokens || tokens.length < 2) throw new Error("tokens array must have at least 2 elements");
 
-  const inputUsdc = input_amount_usdc ?? CONFIG.inputAmountUsdc;
+  // Resolve each token — accepts symbols OR mint addresses
+  const resolvedMints = await Promise.all(tokens.map(async t => {
+    const mint = await resolveMint(t);
+    if (!mint) throw new Error(`Cannot resolve token: ${t}. Try using the full mint address.`);
+    return mint;
+  }));
 
-  // Resolve token symbols to mint addresses
-  const resolvedTokens = tokens.map(t => {
-    // If already looks like a base58 address (len > 20), use as-is
-    if (t.length > 20) return t;
-    // Otherwise look up in known mints
-    if (!MINT_ADDRESSES[t]) throw new Error(`Unknown token symbol: ${t}. Use mint address instead.`);
-    return t; // simulateArbRoute will resolve via MINT_ADDRESSES
-  });
+  // Determine input amount based on base token
+  const baseInfo  = Object.values(BASE_TOKENS).find(b => b.mint === resolvedMints[0]);
+  const inputAmt  = input_amount ?? (baseInfo?.symbol === "SOL" ? CONFIG.inputAmountSol : CONFIG.inputAmountUsdc);
 
   const route = {
-    name:   resolvedTokens.join("→"),
-    tokens: resolvedTokens,
-    hops:   resolvedTokens.length - 1,
+    name:   tokens.join("→"),
+    tokens: resolvedMints, // use resolved mints directly
   };
 
-  const result = await simulateArbRoute(route, inputUsdc);
-  if (!result) return { error: "Could not get quotes for this route — pool may be illiquid or token unknown to Jupiter" };
+  const result = await simulateArbRoute(route, inputAmt);
+  if (!result) return { error: "Could not get quotes — pool may be illiquid or token unavailable on Jupiter" };
 
   return {
-    routeName:      result.routeName,
-    inputUsdc:      result.inputUsdc,
-    outputUsdc:     result.outputUsdc,
-    profitUsdc:     result.profitUsdc,
-    roiMultiplier:  result.roiMultiplier,
-    profitable:     result.profitable,
+    routeName:     result.routeName,
+    inputAmount:   result.inputAmount,
+    outputAmount:  result.outputAmount,
+    profitAmount:  result.profitAmount,
+    roiMultiplier: result.roiMultiplier,
+    profitable:    result.profitable,
     legs: result.legs.map(l => ({
       from:        l.from,
       to:          l.to,
       priceImpact: l.priceImpact,
     })),
+  };
+}
+
+// ── scan_all_routes ───────────────────────────────────────────
+async function tool_scan_all_routes({ max_hops, min_tvl, input_amount } = {}) {
+  const hops      = max_hops   ?? CONFIG.maxHops ?? 3;
+  const minTvl    = min_tvl    ?? CONFIG.minTvl;
+  const inputAmt  = input_amount ?? CONFIG.inputAmountUsdc;
+
+  logger.exec(`[TOOL] scan_all_routes: hops=${hops} minTvl=${minTvl} input=${inputAmt}`);
+
+  const profitable = await scanAllRoutes(inputAmt, { maxHops: hops, minTvl });
+
+  return {
+    total:    profitable.length,
+    routes:   profitable.slice(0, 20).map(r => ({
+      routeName:     r.routeName,
+      tokens:        r.tokens,
+      profitAmount:  r.profitAmount,
+      roiMultiplier: r.roiMultiplier,
+      hops:          r.hops,
+    })),
+    best: profitable[0] ? {
+      routeName:    profitable[0].routeName,
+      profit:       profitable[0].profitAmount,
+      roi:          profitable[0].roiMultiplier,
+    } : null,
   };
 }
 
@@ -182,26 +210,32 @@ async function tool_compare_pool_prices({ pool_addresses }) {
 }
 
 // ── execute_arb ───────────────────────────────────────────────
-async function tool_execute_arb({ tokens, input_amount_usdc, reason }) {
+async function tool_execute_arb({ tokens, input_amount, reason }) {
   if (!tokens || tokens.length < 2) throw new Error("tokens required");
 
   logger.exec(`[AGENT→EXEC] Route: ${tokens.join("→")} | Reason: ${reason}`);
 
-  // First simulate to get live opportunity object
-  const inputUsdc = input_amount_usdc ?? CONFIG.inputAmountUsdc;
-  const route     = { name: tokens.join("→"), tokens, hops: tokens.length - 1 };
-  const sim       = await simulateArbRoute(route, inputUsdc);
+  // Resolve all tokens to mints
+  const resolvedMints = await Promise.all(tokens.map(async t => {
+    const mint = await resolveMint(t);
+    if (!mint) throw new Error(`Cannot resolve token: ${t}`);
+    return mint;
+  }));
 
-  if (!sim) return { success: false, error: "Simulation failed — cannot execute without valid quote" };
-  if (!sim.profitable) return { success: false, error: `Route not profitable: output $${sim.outputUsdc.toFixed(4)} < input $${inputUsdc}` };
-  if (sim.profitUsdc < CONFIG.minProfitUsd * 0.5) {
-    return { success: false, error: `Profit $${sim.profitUsdc.toFixed(2)} too low (min $${CONFIG.minProfitUsd * 0.5})` };
+  const baseInfo = Object.values(BASE_TOKENS).find(b => b.mint === resolvedMints[0]);
+  const inputAmt = input_amount ?? (baseInfo?.symbol === "SOL" ? CONFIG.inputAmountSol : CONFIG.inputAmountUsdc);
+
+  const route = { name: tokens.join("→"), tokens: resolvedMints };
+  const sim   = await simulateArbRoute(route, inputAmt);
+
+  if (!sim)              return { success: false, error: "Simulation failed — no quote available" };
+  if (!sim.profitable)   return { success: false, error: `Route not profitable: out=${sim.outputAmount?.toFixed(4)} < in=${inputAmt}` };
+  if (sim.profitAmount < CONFIG.minProfitUsd * 0.5) {
+    return { success: false, error: `Profit $${sim.profitAmount?.toFixed(2)} too low` };
   }
 
   const result = await executeArb(sim);
-  if (result) {
-    state.recordExec({ ...result, routeName: route.name, agentReason: reason });
-  }
+  if (result) state.recordExec({ ...result, routeName: route.name, agentReason: reason });
 
   return result || { success: false, error: "Executor returned null" };
 }
@@ -211,14 +245,15 @@ export async function dispatchTool(name, args) {
   logger.dim(`[TOOL] ${name}(${JSON.stringify(args).slice(0, 80)}...)`);
 
   const dispatch = {
-    screen_pools:        tool_screen_pools,
-    get_pool_price:      tool_get_pool_price,
-    simulate_route:      tool_simulate_route,
-    get_token_info:      tool_get_token_info,
-    get_wallet_status:   tool_get_wallet_status,
+    screen_pools:          tool_screen_pools,
+    get_pool_price:        tool_get_pool_price,
+    simulate_route:        tool_simulate_route,
+    scan_all_routes:       tool_scan_all_routes,
+    get_token_info:        tool_get_token_info,
+    get_wallet_status:     tool_get_wallet_status,
     get_execution_history: tool_get_execution_history,
-    compare_pool_prices: tool_compare_pool_prices,
-    execute_arb:         tool_execute_arb,
+    compare_pool_prices:   tool_compare_pool_prices,
+    execute_arb:           tool_execute_arb,
   };
 
   const fn = dispatch[name];
