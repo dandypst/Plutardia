@@ -33,18 +33,10 @@
   "agentMaxTokens": 1000,
   "agentConfidenceMin": 70,
 
-  "arbRoutes": [
-    {
-      "name": "USDC→ANX→ANB→USDC",
-      "hops": 3,
-      "tokens": ["USDC", "ANX", "ANB", "USDC"],
-      "pools":  ["DAMM_V2", "DAMM_V2", "DLMM"]
-    },
-    {
-      "name": "USDC→ANB→USDC",
-      "hops": 2,
-      "tokens": ["USDC", "ANB", "USDC"],
-      "pools":  ["DAMM_V2", "DLMM"]
-    }
-  ]
+  "_route_comment": "Route discovery config — no hardcoded routes needed",
+  "baseTokens": ["USDC", "SOL"],
+  "maxHops": 3,
+  "inputAmountUsdc": 0.2,
+  "inputAmountSol": 0.001,
+  "routeScanLimit": 100,
 }
