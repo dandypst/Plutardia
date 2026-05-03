@@ -1,21 +1,17 @@
 // tools/flashloan.js — Marginfi flash loan integration
 // Allows zero-capital arbitrage: borrow USDC → arb → repay in same tx
+// NOTE: Flash loans disabled by default (useFlashLoan=false in config)
 
-import {
-  PublicKey,
-  TransactionInstruction,
-  SystemProgram,
-} from "@solana/web3.js";
 import { getConnection } from "./wallet.js";
 import logger from "../logger.js";
 import CONFIG from "../config.js";
 
-// Marginfi program (mainnet)
-const MARGINFI_PROGRAM = new PublicKey("MFv2hWf31Z9kbCa1snEPdcgx8RN5FMoLDs2MEjAAW8qX");
-const MARGINFI_GROUP   = new PublicKey("4qp6Fx6tnZkY5Wropq9wUYgtFxXKwE6viZxFHg3rdAG8");
-
-// Known Marginfi USDC bank (mainnet)
-const USDC_BANK = new PublicKey("2s37akK2eyBbp8DZgCm7RtsaEz8eJP3Nxd4urLHed47W");
+// Addresses resolved lazily (not at module load) to avoid PublicKey errors
+const MARGINFI_ADDRESSES = {
+  PROGRAM:   "MFv2hWf31Z9kbCa1snEPdcgx8RN5FMoLDs2MEjAAW8qX",
+  GROUP:     "4qp6Fx6tnZkY5Wropq9wUYgtFxXKwE6viZxFHg3rdAG8",
+  USDC_BANK: "2s37akK2eyBbp8DZgCm7RtsaEz8eJP3Nxd4urLHed47W",
+};
 
 // ─────────────────────────────────────────────────────────────
 // NOTE: Full Marginfi flash loan requires the marginfi-client
@@ -26,21 +22,19 @@ const USDC_BANK = new PublicKey("2s37akK2eyBbp8DZgCm7RtsaEz8eJP3Nxd4urLHed47W");
 
 export class FlashLoan {
   constructor({ amountUsdc }) {
-    this.amountUsdc    = amountUsdc;
-    this.amountRaw     = Math.floor(amountUsdc * 1e6);
-    this.available     = false;
-    this.connection    = getConnection();
+    this.amountUsdc = amountUsdc;
+    this.amountRaw  = Math.floor(amountUsdc * 1e6);
+    this.available  = false;
+    this.connection = getConnection();
   }
 
-  // Check if flash loans are available / enabled
   async init() {
     if (!CONFIG.useFlashLoan) {
-      logger.dim("Flash loans disabled in config (useFlashLoan=false)");
+      logger.dim("Flash loans disabled (useFlashLoan=false)");
       return false;
     }
 
     try {
-      // Attempt to dynamically import marginfi SDK
       const { MarginfiClient, getConfig } = await import("@mrgnlabs/marginfi-client-v2");
       this.MarginfiClient = MarginfiClient;
       this.getConfig      = getConfig;
@@ -55,29 +49,25 @@ export class FlashLoan {
     }
   }
 
-  // Build flash loan + arb + repay instruction set
-  // Instructions: [flashBorrowIx, ...arbIxs, flashRepayIx]
   async buildFlashLoanTxInstructions(walletKeypair, arbInstructions) {
     if (!this.available) return null;
 
     try {
+      const { PublicKey } = await import("@solana/web3.js");
+      const usdcBank = new PublicKey(MARGINFI_ADDRESSES.USDC_BANK);
+
       const cfg    = this.getConfig("production");
       const client = await this.MarginfiClient.fetch(cfg, walletKeypair, this.connection);
 
-      // Get or create marginfi account
       const accounts = await client.getMarginfiAccountsForAuthority();
       const mfAcct   = accounts[0] || await client.createMarginfiAccount();
 
-      // Build flash borrow ix
-      const borrowIx = await mfAcct.makeFlashLoanBeginIx(USDC_BANK, this.amountRaw);
+      const borrowIx    = await mfAcct.makeFlashLoanBeginIx(usdcBank, this.amountRaw);
+      const flashFeeBps = 9;
+      const repayAmount = Math.ceil(this.amountRaw * (1 + flashFeeBps / 10000));
+      const repayIx     = await mfAcct.makeFlashLoanEndIx(usdcBank, repayAmount);
 
-      // Calculate repay amount (principal + flash fee ~0.09%)
-      const flashFeeBps  = 9; // Marginfi 0.09% fee
-      const repayAmount  = Math.ceil(this.amountRaw * (1 + flashFeeBps / 10000));
-      const repayIx      = await mfAcct.makeFlashLoanEndIx(USDC_BANK, repayAmount);
-
-      logger.exec(`Flash loan: borrow $${this.amountUsdc}, repay $${repayAmount / 1e6} (fee: ${flashFeeBps}bps)`);
-
+      logger.exec(`Flash loan: borrow $${this.amountUsdc}, repay $${repayAmount / 1e6}`);
       return [borrowIx, ...arbInstructions, repayIx];
     } catch (e) {
       logger.error(`Flash loan build error: ${e.message}`);
@@ -85,10 +75,9 @@ export class FlashLoan {
     }
   }
 
-  // Calculate net profit after flash loan fee
   netProfit(grossProfitUsdc) {
     if (!this.available) return grossProfitUsdc;
-    const flashFee = this.amountUsdc * 0.0009; // 0.09%
+    const flashFee = this.amountUsdc * 0.0009;
     return grossProfitUsdc - flashFee;
   }
 }
