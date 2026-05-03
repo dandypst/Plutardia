@@ -1,42 +1,30 @@
 {
-  "_comment": "Copy this to user-config.json and fill in your values",
-
-  "rpcUrl": "https://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_KEY",
-  "heliusApiKey": "YOUR_HELIUS_API_KEY",
-  "walletKey": "YOUR_BASE58_PRIVATE_KEY",
+  "_comment": "Pengaturan perilaku bot. Semua key/secret masuk ke .env, bukan di sini.",
 
   "dryRun": true,
 
-  "minProfitUsd": 500,
-  "maxSlippagePct": 1.0,
-  "minRoiMultiplier": 50,
-  "inputAmountUsdc": 0.2,
-  "useFlashLoan": false,
-  "maxHops": 3,
-
-  "jitoTipLamports": 100000,
-
-  "scanIntervalMs": 2000,
-  "execTimeoutMs": 30000,
-
-  "minTvl": 5000,
-  "minFeeActiveTvlRatio": 0.02,
-  "minOrganic": 50,
-
-  "telegramBotToken": "",
-  "telegramChatId": "",
-
-  "_agent_comment": "AI Agent settings — requires OPENROUTER_API_KEY in .env",
-  "agentEnabled": true,
-  "agentModel": "anthropic/claude-3.5-haiku",
-  "agentIntervalMs": 30000,
-  "agentMaxTokens": 1000,
-  "agentConfidenceMin": 70,
-
-  "_route_comment": "Route discovery config — no hardcoded routes needed",
   "baseTokens": ["USDC", "SOL"],
   "maxHops": 3,
   "inputAmountUsdc": 0.2,
   "inputAmountSol": 0.001,
   "routeScanLimit": 100,
+
+  "minProfitUsd": 500,
+  "maxSlippagePct": 1.0,
+  "minRoiMultiplier": 100,
+  "minTvl": 5000,
+  "useFlashLoan": false,
+
+  "jitoTipLamports": 100000,
+  "scanIntervalMs": 2000,
+  "execTimeoutMs": 30000,
+
+  "telegramBotToken": "",
+  "telegramChatId": "",
+
+  "agentEnabled": true,
+  "agentModel": "anthropic/claude-3.5-haiku",
+  "agentIntervalMs": 30000,
+  "agentMaxTokens": 1000,
+  "agentConfidenceMin": 70
 }
