@@ -49,19 +49,44 @@ export const TOOL_DEFINITIONS = [
   {
     type: "function",
     function: {
+      name: "scan_all_routes",
+      description: "Scan ALL possible arbitrage routes on Solana by discovering liquid pools from Meteora, building every combination of base→mid→base routes, and simulating each via Jupiter. This is the most powerful tool — use it at the start of each cycle to find the most profitable route across the entire network. Returns ranked list of profitable routes.",
+      parameters: {
+        type: "object",
+        properties: {
+          max_hops: {
+            type: "number",
+            description: "Maximum hops per route (2, 3, or 4). Higher = more routes but slower.",
+          },
+          min_tvl: {
+            type: "number",
+            description: "Minimum pool TVL to consider (default from config)",
+          },
+          input_amount: {
+            type: "number",
+            description: "Input amount in base token units (default from config)",
+          },
+        },
+        required: [],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "simulate_route",
-      description: "Simulate an arbitrage route by fetching real Jupiter quotes for each hop. Returns expected profit, ROI, and price impact. Use this to evaluate any route you discover before recommending execution.",
+      description: "Simulate a specific arbitrage route by fetching real Jupiter quotes for each hop. Accepts token symbols (USDC, SOL) or full mint addresses. Use this to verify a specific route you found, or to test a custom route.",
       parameters: {
         type: "object",
         properties: {
           tokens: {
             type: "array",
             items: { type: "string" },
-            description: "Token symbols or mint addresses in order, e.g. ['USDC', 'ANB', 'USDC'] or full mint addresses",
+            description: "Token route as symbols or mint addresses, e.g. ['USDC', 'ANB', 'USDC'] or ['EPjFW...', 'mint2...', 'EPjFW...']",
           },
-          input_amount_usdc: {
+          input_amount: {
             type: "number",
-            description: "USDC amount to simulate with (default 0.2)",
+            description: "Input amount in base token units (default from config)",
           },
         },
         required: ["tokens"],
@@ -136,18 +161,18 @@ export const TOOL_DEFINITIONS = [
     type: "function",
     function: {
       name: "execute_arb",
-      description: "Execute an arbitrage route. Only call this when you have verified profitability via simulate_route and assessed token safety via get_token_info. Requires high confidence.",
+      description: "Execute an arbitrage route. Only call this when you have verified profitability via simulate_route or scan_all_routes and assessed token safety via get_token_info. Requires high confidence.",
       parameters: {
         type: "object",
         properties: {
           tokens: {
             type: "array",
             items: { type: "string" },
-            description: "Token route to execute, e.g. ['USDC', 'ANB', 'USDC']",
+            description: "Token route to execute — symbols or mint addresses, e.g. ['USDC', 'ANB', 'USDC']",
           },
-          input_amount_usdc: {
+          input_amount: {
             type: "number",
-            description: "USDC to use (default: value from config)",
+            description: "Input amount in base token units (default from config)",
           },
           reason: {
             type: "string",
