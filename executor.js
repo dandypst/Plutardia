@@ -1,5 +1,5 @@
 // executor.js — Arbitrage executor
-// Builds multi-hop swap txs, applies slippage protection, sends via Jito bundle
+// Builds swap txs from simulation result, signs, sends via Jito bundle
 
 import {
   VersionedTransaction,
@@ -8,208 +8,165 @@ import {
 } from "@solana/web3.js";
 import bs58 from "bs58";
 import { getKeypair, getConnection, getSolBalance, getTokenBalance } from "./tools/wallet.js";
-import { getJupiterQuote, getJupiterSwapTx, MINT_ADDRESSES } from "./tools/jupiter.js";
+import { getJupiterQuote, getJupiterSwapTx } from "./tools/jupiter.js";
+import { MINT_ADDRESSES, BASE_TOKENS } from "./tools/token_registry.js";
 import { sendJitoBundle, waitForBundle, buildTipInstruction } from "./tools/jito.js";
 import { FlashLoan } from "./tools/flashloan.js";
 import CONFIG from "./config.js";
 import logger from "./logger.js";
 
-// Execution stats
 let _execCount    = 0;
 let _successCount = 0;
 let _totalProfit  = 0;
 let _isExecuting  = false;
 
-// ── Slippage protection check ────────────────────────────────
-function checkSlippage(expectedOut, actualOut) {
-  const slippage = Math.abs((actualOut - expectedOut) / expectedOut) * 100;
+// ── Slippage check ────────────────────────────────────────────
+function checkSlippage(expected, actual) {
+  const slippage = Math.abs((actual - expected) / expected) * 100;
   if (slippage > CONFIG.maxSlippagePct) {
-    throw new Error(
-      `Slippage too high: ${slippage.toFixed(2)}% > max ${CONFIG.maxSlippagePct}%`
-    );
+    throw new Error(`Slippage ${slippage.toFixed(2)}% > max ${CONFIG.maxSlippagePct}%`);
   }
   return slippage;
 }
 
-// ── Build all swap legs via Jupiter ──────────────────────────
-async function buildSwapLegs(route, inputAmountUsdc, walletPubkey) {
-  const legs      = [];
-  let currentMint = MINT_ADDRESSES.USDC;
-  let currentAmt  = Math.floor(inputAmountUsdc * 1e6);
+// ── Re-quote all legs and build fresh swap txs ────────────────
+async function buildSwapLegs(sim, walletPubkey) {
+  const legs = [];
 
-  for (let i = 0; i < route.tokens.length - 1; i++) {
-    const fromToken = route.tokens[i];
-    const toToken   = route.tokens[i + 1];
-    const fromMint  = MINT_ADDRESSES[fromToken] || fromToken;
-    const toMint    = MINT_ADDRESSES[toToken]   || toToken;
+  for (let i = 0; i < sim.legs.length; i++) {
+    const leg = sim.legs[i];
 
-    logger.exec(`  Leg ${i + 1}: ${fromToken} → ${toToken} (${currentAmt} raw)`);
+    logger.exec(`  Leg ${i + 1}: ${leg.from} → ${leg.to} (${leg.inputAmount} raw)`);
 
-    const quote = await getJupiterQuote({
-      inputMint:   fromMint,
-      outputMint:  toMint,
-      amount:      currentAmt,
+    const freshQuote = await getJupiterQuote({
+      inputMint:   leg.fromMint || leg.from,
+      outputMint:  leg.toMint   || leg.to,
+      amount:      leg.inputAmount,
       slippageBps: Math.floor(CONFIG.maxSlippagePct * 100),
     });
 
-    if (!quote) throw new Error(`No quote for leg ${i + 1}: ${fromToken}→${toToken}`);
+    if (!freshQuote) throw new Error(`Re-quote failed: leg ${i + 1} ${leg.from}→${leg.to}`);
 
-    const swapTxBase64 = await getJupiterSwapTx(quote, walletPubkey);
-    if (!swapTxBase64) throw new Error(`No swap tx for leg ${i + 1}`);
+    const swapTxBase64 = await getJupiterSwapTx(freshQuote, walletPubkey);
+    if (!swapTxBase64) throw new Error(`No swap tx: leg ${i + 1}`);
 
-    legs.push({
-      from:        fromToken,
-      to:          toToken,
-      inputAmount: currentAmt,
-      outputAmount: quote.outputAmount,
-      minOutput:    quote.minOutput,
-      priceImpact:  quote.priceImpactPct,
-      swapTxBase64,
-      quote,
-    });
-
-    currentMint = toMint;
-    currentAmt  = quote.outputAmount;
+    legs.push({ ...leg, outputAmount: freshQuote.outputAmount, minOutput: freshQuote.minOutput, swapTxBase64, freshQuote });
   }
 
   return legs;
 }
 
-// ── Main execute function ─────────────────────────────────────
+// ── Main execute ──────────────────────────────────────────────
 export async function executeArb(opportunity) {
   if (_isExecuting) {
-    logger.warn("Already executing — skipping concurrent execution");
+    logger.warn("Already executing — skipping");
     return null;
   }
 
   _isExecuting = true;
   _execCount++;
 
-  const { routeName, inputUsdc, profitUsdc, roiMultiplier } = opportunity;
+  const {
+    routeName,
+    inputAmount,   inputUsdc,    // inputAmount is canonical; inputUsdc is compat alias
+    profitAmount,  profitUsdc,
+    roiMultiplier,
+    baseMint,
+    legs: simLegs,
+  } = opportunity;
+
+  const input  = inputAmount  ?? inputUsdc  ?? CONFIG.inputAmountUsdc;
+  const profit = profitAmount ?? profitUsdc ?? 0;
+
+  // Determine base token decimals
+  const baseInfo  = baseMint ? Object.values(BASE_TOKENS).find(b => b.mint === baseMint) : BASE_TOKENS.USDC;
+  const decimals  = baseInfo?.decimals ?? 6;
+  const baseSymbol = baseInfo?.symbol ?? "USDC";
+
   logger.banner(`EXECUTING ARB #${_execCount}`);
-  logger.exec(`Route:  ${routeName}`);
-  logger.exec(`Input:  $${inputUsdc.toFixed(4)} USDC`);
-  logger.exec(`Expect: $${(inputUsdc + profitUsdc).toFixed(2)} USDC out (${roiMultiplier.toFixed(0)}x ROI)`);
+  logger.exec(`Route:   ${routeName}`);
+  logger.exec(`Input:   ${input} ${baseSymbol}`);
+  logger.exec(`Expect:  ${(input + profit).toFixed(6)} ${baseSymbol} out (${roiMultiplier?.toFixed(0)}x ROI)`);
 
   try {
     const kp         = getKeypair();
     const connection = getConnection();
     const walletAddr = kp.publicKey.toBase58();
 
-    // ── Pre-execution checks ──────────────────────────────────
-    const sol  = await getSolBalance();
-    const usdc = await getTokenBalance(MINT_ADDRESSES.USDC, walletAddr) / 1e6;
+    // ── Pre-checks ────────────────────────────────────────────
+    const sol = await getSolBalance();
+    if (sol < 0.005) throw new Error(`SOL too low: ${sol.toFixed(6)} (need ≥0.005)`);
 
-    if (sol < 0.005) throw new Error(`Insufficient SOL for fees: ${sol} SOL`);
-
-    if (!CONFIG.useFlashLoan && usdc < inputUsdc) {
-      throw new Error(`Insufficient USDC: have $${usdc.toFixed(2)}, need $${inputUsdc.toFixed(4)}`);
+    if (!CONFIG.useFlashLoan && baseSymbol === "USDC") {
+      const usdcBal = await getTokenBalance(BASE_TOKENS.USDC.mint, walletAddr) / 1e6;
+      if (usdcBal < input) throw new Error(`USDC too low: $${usdcBal.toFixed(2)} < $${input}`);
     }
 
-    logger.exec(`Pre-check OK: SOL=${sol.toFixed(4)}, USDC=$${usdc.toFixed(2)}`);
+    logger.exec(`Pre-check OK | SOL=${sol.toFixed(4)}`);
 
-    // ── Flash loan setup (optional) ───────────────────────────
+    // ── Flash loan ────────────────────────────────────────────
     let flashLoan = null;
-    if (CONFIG.useFlashLoan) {
-      flashLoan = new FlashLoan({ amountUsdc: inputUsdc });
+    if (CONFIG.useFlashLoan && baseSymbol === "USDC") {
+      flashLoan = new FlashLoan({ amountUsdc: input });
       const ok = await flashLoan.init();
-      if (!ok) {
-        logger.warn("Flash loan unavailable — using wallet USDC instead");
-        flashLoan = null;
-      }
+      if (!ok) { logger.warn("Flash loan unavailable — using wallet funds"); flashLoan = null; }
     }
 
-    // ── Find the route config ──────────────────────────────────
-    let route = CONFIG.arbRoutes.find(r => r.name === routeName);
-    if (!route) {
-      // Reconstruct from simLegs: [leg0.from, leg0.to, leg1.to, ...]
-      const simLegsData = opportunity.legs;
-      if (!simLegsData || simLegsData.length === 0) {
-        throw new Error("Cannot reconstruct route — no legs data and route not in config");
-      }
-      const tokens = [simLegsData[0].from, ...simLegsData.map(l => l.to)];
-      route = { name: routeName, tokens };
+    // ── Validate legs exist ───────────────────────────────────
+    if (!simLegs || simLegs.length === 0) {
+      throw new Error("No legs in opportunity — run simulate first");
     }
 
-    if (!route.tokens || route.tokens.length < 2) {
-      throw new Error("Cannot reconstruct route tokens");
-    }
+    // ── Build fresh swap txs ──────────────────────────────────
+    logger.exec(`Building ${simLegs.length} legs...`);
+    const legs = await buildSwapLegs(opportunity, walletAddr);
 
-    // ── Build swap legs ───────────────────────────────────────
-    logger.exec(`Building ${route.tokens.length - 1} swap legs...`);
-    const legs = await buildSwapLegs(route, inputUsdc, walletAddr);
-
-    // ── Verify final output before executing ──────────────────
-    const finalOutputUsdc = legs[legs.length - 1].outputAmount / 1e6;
-    const expectedOutput  = inputUsdc + profitUsdc;
-    const slippage        = checkSlippage(expectedOutput, finalOutputUsdc);
-
-    const netProfit = flashLoan
-      ? flashLoan.netProfit(finalOutputUsdc - inputUsdc)
-      : finalOutputUsdc - inputUsdc;
+    // ── Verify output ─────────────────────────────────────────
+    const finalRaw = legs[legs.length - 1].outputAmount;
+    const finalAmt = finalRaw / Math.pow(10, decimals);
+    const slippage = checkSlippage(input + profit, finalAmt);
+    const netProfit = flashLoan ? flashLoan.netProfit(finalAmt - input) : finalAmt - input;
 
     if (netProfit < CONFIG.minProfitUsd * 0.5) {
-      throw new Error(
-        `Net profit $${netProfit.toFixed(2)} below threshold after slippage (${slippage.toFixed(2)}%)`
-      );
+      throw new Error(`Net profit ${netProfit.toFixed(6)} too low after ${slippage.toFixed(2)}% slippage`);
     }
 
-    logger.exec(`Slippage: ${slippage.toFixed(2)}% | Net profit: $${netProfit.toFixed(2)}`);
+    logger.exec(`Slippage: ${slippage.toFixed(2)}% | Net: ${netProfit.toFixed(6)} ${baseSymbol}`);
 
-    // ── Deserialize and sign transactions ─────────────────────
+    // ── Sign txs ──────────────────────────────────────────────
     const signedTxs = [];
 
-    for (let i = 0; i < legs.length; i++) {
-      const leg      = legs[i];
-      const txBuf    = Buffer.from(leg.swapTxBase64, "base64");
-      const isLast   = i === legs.length - 1;
-
+    for (const leg of legs) {
+      const txBuf = Buffer.from(leg.swapTxBase64, "base64");
       let serialized;
-
       try {
-        // Try VersionedTransaction first (Jupiter always returns versioned)
         const tx = VersionedTransaction.deserialize(txBuf);
-
-        // For VersionedTransaction, Jito tip is sent as a separate last tx in the bundle
-        // (VersionedTransaction does not support .add() — tip handled below outside loop)
         tx.sign([kp]);
         serialized = bs58.encode(tx.serialize());
       } catch {
-        // Fall back to legacy Transaction
         const tx = Transaction.from(txBuf);
-        if (isLast) {
-          // Add Jito tip to the last legacy tx
-          tx.add(buildTipInstruction(kp.publicKey));
-        }
         tx.partialSign(kp);
         serialized = bs58.encode(tx.serialize());
       }
-
       signedTxs.push(serialized);
     }
 
-    // ── Append standalone Jito tip tx for VersionedTransaction bundles ──
-    // Jito accepts a separate tip transfer as the last tx in a bundle
-    {
-      const tipIx   = buildTipInstruction(kp.publicKey);
-      const conn    = getConnection();
-      const { blockhash } = await conn.getLatestBlockhash("confirmed");
-      const tipMsg  = new TransactionMessage({
-        payerKey:    kp.publicKey,
-        recentBlockhash: blockhash,
-        instructions: [tipIx],
-      }).compileToV0Message();
-      const tipTx   = new VersionedTransaction(tipMsg);
-      tipTx.sign([kp]);
-      signedTxs.push(bs58.encode(tipTx.serialize()));
-    }
+    // Append Jito tip as separate tx
+    const tipIx  = buildTipInstruction(kp.publicKey);
+    const { blockhash } = await connection.getLatestBlockhash("confirmed");
+    const tipMsg = new TransactionMessage({
+      payerKey: kp.publicKey, recentBlockhash: blockhash, instructions: [tipIx],
+    }).compileToV0Message();
+    const tipTx = new VersionedTransaction(tipMsg);
+    tipTx.sign([kp]);
+    signedTxs.push(bs58.encode(tipTx.serialize()));
 
-    logger.exec(`Signed ${signedTxs.length} transactions — sending Jito bundle...`);
+    logger.exec(`Signed ${signedTxs.length} txs — sending Jito bundle...`);
 
     // ── Send bundle ───────────────────────────────────────────
     let bundleResult;
     if (CONFIG.dryRun) {
-      logger.warn("[DRY RUN] Skipping actual bundle submission");
+      logger.warn("[DRY RUN] Bundle not sent");
       bundleResult = { bundleId: "dry-" + Date.now(), confirmed: true, status: "dry_run" };
     } else {
       const { bundleId } = await sendJitoBundle(signedTxs);
@@ -221,17 +178,10 @@ export async function executeArb(opportunity) {
       _successCount++;
       _totalProfit += netProfit;
 
-      logger.success(`✅ ARB SUCCESS #${_execCount}`);
-      logger.success(`   Bundle: ${bundleResult.bundleId}`);
-      logger.success(`   Profit: $${netProfit.toFixed(2)} USDC`);
-      logger.success(`   Total profit: $${_totalProfit.toFixed(2)} USDC`);
+      logger.success(`✅ ARB SUCCESS #${_execCount} | bundle: ${bundleResult.bundleId}`);
+      logger.success(`   Profit: ${netProfit.toFixed(6)} ${baseSymbol} | Total: ${_totalProfit.toFixed(4)}`);
 
-      return {
-        success:   true,
-        bundleId:  bundleResult.bundleId,
-        profit:    netProfit,
-        status:    bundleResult.status,
-      };
+      return { success: true, bundleId: bundleResult.bundleId, profit: netProfit, status: bundleResult.status };
     } else {
       throw new Error(`Bundle not confirmed: ${bundleResult.status}`);
     }
