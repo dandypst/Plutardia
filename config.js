@@ -57,7 +57,8 @@ export const CONFIG = {
   telegramBotToken:  process.env.TELEGRAM_BOT_TOKEN || userCfg.telegramBotToken || "",
   telegramChatId:    process.env.TELEGRAM_CHAT_ID   || userCfg.telegramChatId   || "",
 
-  // ─ AI Agent (OpenRouter)
+  // ─ Jupiter
+  jupiterApiKey:     process.env.JUPITER_API_KEY || userCfg.jupiterApiKey || "",
   openRouterApiKey:    process.env.OPENROUTER_API_KEY || userCfg.openRouterApiKey || "",
   agentModel:          userCfg.agentModel          ?? "anthropic/claude-3.5-haiku",  // model untuk reasoning
   agentIntervalMs:     userCfg.agentIntervalMs     ?? 30_000,  // seberapa sering agent reasoning (ms)
@@ -81,6 +82,7 @@ export const CONFIG = {
   inputAmountUsdc:   userCfg.inputAmountUsdc   ?? 0.2,              // input per arb (in base token units)
   inputAmountSol:    userCfg.inputAmountSol    ?? 0.001,            // SOL input when base=SOL
   routeScanLimit:    userCfg.routeScanLimit    ?? 100,              // max pools to pull from Meteora
+  maxMidTokens:      userCfg.maxMidTokens      ?? 10,               // max mid-tokens per scan (keep low for free Jupiter tier)
 };
 
 export default CONFIG;
