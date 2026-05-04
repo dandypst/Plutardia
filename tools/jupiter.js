@@ -1,45 +1,47 @@
 // tools/jupiter.js — Jupiter aggregator integration
-// Now uses token_registry for dynamic mint resolution (no hardcoded tokens)
+// Supports API key for paid tier (higher rate limits)
 
 import axios from "axios";
 import logger from "../logger.js";
 import { resolveMint, BASE_TOKENS, MINT_ADDRESSES } from "./token_registry.js";
+import CONFIG from "../config.js";
 
 export { MINT_ADDRESSES } from "./token_registry.js";
 
+// ── Endpoints & headers ───────────────────────────────────────
 const JUPITER_ENDPOINTS = [
   "https://api.jup.ag/swap/v1",
   "https://lite-api.jup.ag/swap/v1",
 ];
 
-let _activeEndpoint = JUPITER_ENDPOINTS[0];
-
-// ── Simple quote cache (TTL 30s) to reduce API hammering ──────
-const _quoteCache   = new Map();
-const CACHE_TTL_MS  = 30_000;
-
-function cacheKey(inMint, outMint, amount) {
-  return `${inMint}:${outMint}:${amount}`;
+function getHeaders() {
+  return CONFIG.jupiterApiKey
+    ? { "x-api-key": CONFIG.jupiterApiKey }
+    : {};
 }
 
-async function jupiterGet(path, params, retries = 2) {
+// ── Quote cache (TTL 30s) ─────────────────────────────────────
+const _quoteCache  = new Map();
+const CACHE_TTL_MS = 30_000;
+function cacheKey(a, b, n) { return `${a}:${b}:${n}`; }
+
+// ── HTTP helpers with retry ───────────────────────────────────
+async function jupiterGet(path, params, retries = 3) {
+  const headers = getHeaders();
   for (const base of JUPITER_ENDPOINTS) {
     for (let attempt = 0; attempt <= retries; attempt++) {
       try {
-        const resp = await axios.get(`${base}${path}`, { params, timeout: 15000 });
-        _activeEndpoint = base;
-        return resp;
+        return await axios.get(`${base}${path}`, { params, headers, timeout: 15000 });
       } catch (e) {
-        if (e.code === "ENOTFOUND" || e.code === "ECONNREFUSED") {
-          logger.warn(`Jupiter endpoint unreachable: ${base} — trying next...`);
-          break;
-        }
+        if (e.code === "ENOTFOUND" || e.code === "ECONNREFUSED") break; // try next endpoint
         if (e?.response?.status === 429 && attempt < retries) {
-          await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
+          // Paid tier: short wait. Free tier: longer wait.
+          const wait = CONFIG.jupiterApiKey ? 100 : 2000 * (attempt + 1);
+          logger.warn(`Jupiter 429 — waiting ${wait}ms (attempt ${attempt + 1}/${retries})`);
+          await new Promise(r => setTimeout(r, wait));
           continue;
         }
         if (e.code === "ECONNABORTED" && attempt < retries) {
-          // timeout — retry once with same endpoint
           await new Promise(r => setTimeout(r, 500));
           continue;
         }
@@ -47,54 +49,49 @@ async function jupiterGet(path, params, retries = 2) {
       }
     }
   }
-  throw new Error("All Jupiter endpoints unreachable or rate limited");
+  throw new Error("All Jupiter endpoints failed");
 }
 
-async function jupiterPost(path, body) {
+async function jupiterPost(path, body, retries = 2) {
+  const headers = getHeaders();
   for (const base of JUPITER_ENDPOINTS) {
-    try {
-      const resp = await axios.post(`${base}${path}`, body, { timeout: 15000 });
-      return resp;
-    } catch (e) {
-      if (e.code === "ENOTFOUND" || e.code === "ECONNREFUSED") {
-        logger.warn(`Jupiter endpoint unreachable: ${base} — trying next...`);
-        continue;
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      try {
+        return await axios.post(`${base}${path}`, body, { headers, timeout: 15000 });
+      } catch (e) {
+        if (e.code === "ENOTFOUND" || e.code === "ECONNREFUSED") break;
+        if (e?.response?.status === 429 && attempt < retries) {
+          await new Promise(r => setTimeout(r, CONFIG.jupiterApiKey ? 100 : 1000));
+          continue;
+        }
+        throw e;
       }
-      throw e;
     }
   }
-  throw new Error("All Jupiter endpoints unreachable");
+  throw new Error("All Jupiter endpoints failed");
 }
 
-// ── Get a swap quote from Jupiter ────────────────────────────
+// ── Get a swap quote ──────────────────────────────────────────
 export async function getJupiterQuote({
-  inputMint,
-  outputMint,
-  amount,
-  slippageBps = 50,
-  onlyDirectRoutes = false,
+  inputMint, outputMint, amount, slippageBps = 50, onlyDirectRoutes = false,
 } = {}) {
   try {
     const inMint  = (await resolveMint(inputMint))  || inputMint;
     const outMint = (await resolveMint(outputMint)) || outputMint;
 
-    // Check cache
+    // Cache check
     const key    = cacheKey(inMint, outMint, amount);
     const cached = _quoteCache.get(key);
-    if (cached && Date.now() - cached.ts < CACHE_TTL_MS) {
-      return cached.data;
-    }
+    if (cached && Date.now() - cached.ts < CACHE_TTL_MS) return cached.data;
 
     const resp = await jupiterGet("/quote", {
-      inputMint:  inMint,
-      outputMint: outMint,
-      amount:     amount.toString(),
-      slippageBps: slippageBps.toString(),
+      inputMint: inMint, outputMint: outMint,
+      amount: amount.toString(), slippageBps: slippageBps.toString(),
       onlyDirectRoutes: onlyDirectRoutes.toString(),
       restrictIntermediateTokens: "true",
     });
 
-    const q = resp.data;
+    const q      = resp.data;
     const result = {
       inputAmount:    parseInt(q.inAmount),
       outputAmount:   parseInt(q.outAmount),
@@ -104,9 +101,7 @@ export async function getJupiterQuote({
       raw:            q,
     };
 
-    // Cache result
     _quoteCache.set(key, { data: result, ts: Date.now() });
-
     return result;
   } catch (e) {
     logger.error(`getJupiterQuote: ${e.message}`);
@@ -114,7 +109,7 @@ export async function getJupiterQuote({
   }
 }
 
-// ── Get swap transaction from Jupiter ────────────────────────
+// ── Get swap transaction ──────────────────────────────────────
 export async function getJupiterSwapTx(quote, userPublicKey, { wrapUnwrapSOL = true } = {}) {
   try {
     const resp = await jupiterPost("/swap", {
@@ -131,71 +126,50 @@ export async function getJupiterSwapTx(quote, userPublicKey, { wrapUnwrapSOL = t
   }
 }
 
-// ── Get USD price for any token ───────────────────────────────
+// ── Get token price ───────────────────────────────────────────
 export async function getTokenPrice(mintAddr) {
   try {
-    const resp = await jupiterGet("/price", { ids: mintAddr });
-    const data = resp.data?.data?.[mintAddr];
-    return data ? parseFloat(data.price) : null;
+    const quote = await getJupiterQuote({
+      inputMint:  mintAddr,
+      outputMint: BASE_TOKENS.USDC.mint,
+      amount:     1_000_000,
+    });
+    return quote ? quote.outputAmount / 1e6 : null;
   } catch {
-    // Fallback: derive price from a USDC quote
-    try {
-      const quote = await getJupiterQuote({
-        inputMint:  mintAddr,
-        outputMint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-        amount:     1_000_000,
-      });
-      return quote ? quote.outputAmount / 1e6 : null;
-    } catch {
-      return null;
-    }
+    return null;
   }
 }
 
-// ── Simulate a multi-hop arb route ────────────────────────────
-// Accepts token symbols OR raw mint addresses
-// Base token (first/last) can be USDC or SOL
+// ── Simulate multi-hop arb route ─────────────────────────────
 export async function simulateArbRoute(route, inputAmount) {
   const firstToken = route.tokens[0];
   const baseMint   = (await resolveMint(firstToken)) || firstToken;
-
-  const baseInfo = Object.values(BASE_TOKENS).find(b => b.mint === baseMint);
-  const decimals = baseInfo?.decimals ?? 6;
-  const inputRaw = Math.floor(inputAmount * Math.pow(10, decimals));
+  const baseInfo   = Object.values(BASE_TOKENS).find(b => b.mint === baseMint);
+  const decimals   = baseInfo?.decimals ?? 6;
+  const inputRaw   = Math.floor(inputAmount * Math.pow(10, decimals));
 
   let currentAmount = inputRaw;
   const legs        = [];
 
   for (let i = 0; i < route.tokens.length - 1; i++) {
-    const fromToken = route.tokens[i];
-    const toToken   = route.tokens[i + 1];
-    const fromMint  = (await resolveMint(fromToken)) || fromToken;
-    const toMint    = (await resolveMint(toToken))   || toToken;
+    const fromMint = (await resolveMint(route.tokens[i]))     || route.tokens[i];
+    const toMint   = (await resolveMint(route.tokens[i + 1])) || route.tokens[i + 1];
 
-    if (!fromMint || !toMint) {
-      logger.warn(`simulateArbRoute: cannot resolve ${fromToken} or ${toToken}`);
-      return null;
-    }
+    if (!fromMint || !toMint) return null;
 
     const quote = await getJupiterQuote({
-      inputMint:   fromMint,
-      outputMint:  toMint,
-      amount:      currentAmount,
-      slippageBps: 100,
+      inputMint: fromMint, outputMint: toMint,
+      amount: currentAmount, slippageBps: 100,
     });
 
     if (!quote) return null;
 
     legs.push({
-      from:        fromToken,
-      to:          toToken,
-      fromMint,
-      toMint,
-      inputAmount: currentAmount,
-      outputAmount: quote.outputAmount,
-      minOutput:   quote.minOutput,
-      priceImpact: quote.priceImpactPct,
-      raw:         quote.raw,
+      from: route.tokens[i], to: route.tokens[i + 1],
+      fromMint, toMint,
+      inputAmount: currentAmount, outputAmount: quote.outputAmount,
+      minOutput: quote.minOutput, priceImpact: quote.priceImpactPct,
+      raw: quote.raw,
     });
 
     currentAmount = quote.outputAmount;
@@ -206,17 +180,10 @@ export async function simulateArbRoute(route, inputAmount) {
   const roiMultiplier = finalAmt / inputAmount;
 
   return {
-    routeName:     route.name,
-    tokens:        route.tokens,
-    baseMint,
-    inputAmount,
-    inputUsdc:     inputAmount,
-    outputAmount:  finalAmt,
-    outputUsdc:    finalAmt,
-    profitAmount:  profitAmt,
-    profitUsdc:    profitAmt,
-    roiMultiplier,
-    profitable:    profitAmt > 0,
-    legs,
+    routeName: route.name, tokens: route.tokens, baseMint,
+    inputAmount, inputUsdc: inputAmount,
+    outputAmount: finalAmt, outputUsdc: finalAmt,
+    profitAmount: profitAmt, profitUsdc: profitAmt,
+    roiMultiplier, profitable: profitAmt > 0, legs,
   };
 }
