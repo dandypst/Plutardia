@@ -17,17 +17,17 @@ function getBaseMints() {
 // ── Discover all liquid token mints from Meteora pools ────────
 export async function discoverLiquidTokens({ minTvl, limit = 100 } = {}) {
   const tvlThreshold = minTvl ?? CONFIG.minTvl;
-
   const pools = await screenPools({ minTvl: tvlThreshold, limit, sortBy: "volume" });
 
-  // Register all new tokens found in pools
+  // Register token metadata from pool data (no extra API call needed
+  // because normPool() already extracts symbol, decimals, verified from token_x/token_y)
   await registerPoolTokens(pools);
 
-  const baseMints  = new Set(getBaseMints().map(b => b.mint));
-  const midTokens  = new Set();
+  const baseMints = new Set(getBaseMints().map(b => b.mint));
+  const midTokens = new Set();
 
   for (const pool of pools) {
-    // Collect mid-tokens: pool tokens that are NOT base tokens
+    // mintX and mintY already normalized by normPool()
     if (pool.mintX && !baseMints.has(pool.mintX)) midTokens.add(pool.mintX);
     if (pool.mintY && !baseMints.has(pool.mintY)) midTokens.add(pool.mintY);
   }
