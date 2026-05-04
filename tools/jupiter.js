@@ -14,21 +14,27 @@ const JUPITER_ENDPOINTS = [
 
 let _activeEndpoint = JUPITER_ENDPOINTS[0];
 
-async function jupiterGet(path, params) {
+async function jupiterGet(path, params, retries = 2) {
   for (const base of JUPITER_ENDPOINTS) {
-    try {
-      const resp = await axios.get(`${base}${path}`, { params, timeout: 8000 });
-      _activeEndpoint = base; // cache working endpoint
-      return resp;
-    } catch (e) {
-      if (e.code === "ENOTFOUND" || e.code === "ECONNREFUSED") {
-        logger.warn(`Jupiter endpoint unreachable: ${base} — trying next...`);
-        continue;
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      try {
+        const resp = await axios.get(`${base}${path}`, { params, timeout: 8000 });
+        _activeEndpoint = base;
+        return resp;
+      } catch (e) {
+        if (e.code === "ENOTFOUND" || e.code === "ECONNREFUSED") {
+          logger.warn(`Jupiter endpoint unreachable: ${base} — trying next...`);
+          break; // try next endpoint
+        }
+        if (e?.response?.status === 429 && attempt < retries) {
+          await new Promise(r => setTimeout(r, 500 * (attempt + 1)));
+          continue; // retry same endpoint
+        }
+        throw e;
       }
-      throw e; // other errors (4xx, 5xx) propagate normally
     }
   }
-  throw new Error("All Jupiter endpoints unreachable");
+  throw new Error("All Jupiter endpoints unreachable or rate limited");
 }
 
 async function jupiterPost(path, body) {
