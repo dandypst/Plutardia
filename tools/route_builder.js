@@ -161,24 +161,29 @@ export async function simulateRoute(route, inputAmount) {
 
 // ── Scan ALL discovered routes, return profitable ones ────────
 export async function scanAllRoutes(inputAmount, { maxHops, minTvl } = {}) {
-  const { baseMints, midTokens, pools } = await discoverLiquidTokens({ minTvl });
+  const { baseMints, midTokens } = await discoverLiquidTokens({ minTvl });
 
   if (midTokens.length === 0) {
     logger.warn("Route builder: no mid-tokens discovered");
     return [];
   }
 
-  const routes     = buildRoutes(baseMints, midTokens, maxHops ?? CONFIG.maxHops ?? 3);
-  const profitable = [];
+  // Limit mid-tokens to top 20 to avoid rate limits
+  const topMidTokens = midTokens.slice(0, 20);
+  const hops         = maxHops ?? CONFIG.maxHops ?? 3;
+  const routes       = buildRoutes(baseMints, topMidTokens, Math.min(hops, 3)); // cap at 3-hop
+  const profitable   = [];
 
-  logger.scan(`Scanning ${routes.length} routes (${baseMints.length} base × ${midTokens.length} mid-tokens, max ${maxHops ?? CONFIG.maxHops}hop)...`);
+  logger.scan(`Scanning ${routes.length} routes (${baseMints.length} base × ${topMidTokens.length} mid-tokens, max ${Math.min(hops, 3)}hop)...`);
 
-  // Batch simulate with concurrency limit to avoid rate limits
-  const CONCURRENCY = 5;
+  // Process sequentially with delay to respect rate limits
+  const DELAY_MS    = 200; // 200ms between requests = ~5 req/sec
+  const CONCURRENCY = 2;   // max 2 parallel
+
   for (let i = 0; i < routes.length; i += CONCURRENCY) {
     const batch   = routes.slice(i, i + CONCURRENCY);
     const results = await Promise.allSettled(
-      batch.map(r => simulateRoute(r, inputAmount))
+      batch.map(r => simulateRouteWithRetry(r, inputAmount))
     );
 
     for (const res of results) {
@@ -194,12 +199,31 @@ export async function scanAllRoutes(inputAmount, { maxHops, minTvl } = {}) {
         logger.found(`🔥 ${sim.routeName} | profit=$${sim.profitAmount.toFixed(2)} | ROI=${sim.roiMultiplier.toFixed(0)}x`);
       }
     }
+
+    // Delay between batches
+    if (i + CONCURRENCY < routes.length) {
+      await new Promise(r => setTimeout(r, DELAY_MS));
+    }
   }
 
-  // Sort by profit descending
   profitable.sort((a, b) => b.profitAmount - a.profitAmount);
-
   return profitable;
+}
+
+// ── Simulate with retry on 429 ────────────────────────────────
+async function simulateRouteWithRetry(route, inputAmount, retries = 2) {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      return await simulateRoute(route, inputAmount);
+    } catch (e) {
+      if (e?.response?.status === 429 && attempt < retries) {
+        await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
+        continue;
+      }
+      return null;
+    }
+  }
+  return null;
 }
 
 // ── Symbol shorthand helper ───────────────────────────────────
