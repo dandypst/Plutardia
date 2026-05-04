@@ -5,10 +5,10 @@
   "main": "index.js",
   "type": "module",
   "scripts": {
-    "start": "node index.js",
-    "dev": "DRY_RUN=true node index.js",
-    "scan": "node tools/scanner.js",
-    "status": "node get_status.js"
+    "start": "node --env-file=.env index.js",
+    "dev": "node --env-file=.env index.js",
+    "scan": "node --env-file=.env tools/scanner.js",
+    "status": "node --env-file=.env get_status.js"
   },
   "dependencies": {
     "@solana/web3.js": "^1.95.0",
