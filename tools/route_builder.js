@@ -169,10 +169,9 @@ export async function scanAllRoutes(inputAmount, { maxHops, minTvl } = {}) {
   }
 
   // With API key: more mid-tokens and faster. Without: conservative.
-  const maxMid   = CONFIG.jupiterApiKey
-    ? (CONFIG.maxMidTokens ?? 30)
-    : (CONFIG.maxMidTokens ?? 10);
-  const DELAY_MS = CONFIG.jupiterApiKey ? 50 : 600;
+  const hasApiKey = !!(CONFIG.jupiterApiKey || process.env.JUPITER_API_KEY);
+  const maxMid    = hasApiKey ? (CONFIG.maxMidTokens ?? 30) : (CONFIG.maxMidTokens ?? 10);
+  const DELAY_MS  = hasApiKey ? 50 : 600;
 
   const topMidTokens = midTokens.slice(0, maxMid);
   const hops         = Math.min(maxHops ?? CONFIG.maxHops ?? 2, CONFIG.jupiterApiKey ? 3 : 2);
