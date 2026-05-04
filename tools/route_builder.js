@@ -168,42 +168,30 @@ export async function scanAllRoutes(inputAmount, { maxHops, minTvl } = {}) {
     return [];
   }
 
-  // Limit mid-tokens to top 20 to avoid rate limits
-  const topMidTokens = midTokens.slice(0, 20);
-  const hops         = maxHops ?? CONFIG.maxHops ?? 3;
-  const routes       = buildRoutes(baseMints, topMidTokens, Math.min(hops, 3)); // cap at 3-hop
+  // With API key: more mid-tokens and faster. Without: conservative.
+  const maxMid   = CONFIG.jupiterApiKey
+    ? (CONFIG.maxMidTokens ?? 30)
+    : (CONFIG.maxMidTokens ?? 10);
+  const DELAY_MS = CONFIG.jupiterApiKey ? 50 : 600;
+
+  const topMidTokens = midTokens.slice(0, maxMid);
+  const hops         = Math.min(maxHops ?? CONFIG.maxHops ?? 2, CONFIG.jupiterApiKey ? 3 : 2);
+  const routes       = buildRoutes(baseMints, topMidTokens, hops);
   const profitable   = [];
 
-  logger.scan(`Scanning ${routes.length} routes (${baseMints.length} base × ${topMidTokens.length} mid-tokens, max ${Math.min(hops, 3)}hop)...`);
+  logger.scan(`Scanning ${routes.length} routes (${baseMints.length} base × ${topMidTokens.length} mid, max ${hops}hop) | delay=${DELAY_MS}ms...`);
 
-  // Process sequentially with delay to respect rate limits
-  const DELAY_MS    = 200; // 200ms between requests = ~5 req/sec
-  const CONCURRENCY = 2;   // max 2 parallel
-
-  for (let i = 0; i < routes.length; i += CONCURRENCY) {
-    const batch   = routes.slice(i, i + CONCURRENCY);
-    const results = await Promise.allSettled(
-      batch.map(r => simulateRouteWithRetry(r, inputAmount))
-    );
-
-    for (const res of results) {
-      if (res.status !== "fulfilled" || !res.value) continue;
-      const sim = res.value;
-
-      if (
-        sim.profitable &&
-        sim.profitAmount  >= CONFIG.minProfitUsd &&
-        sim.roiMultiplier >= CONFIG.minRoiMultiplier
-      ) {
-        profitable.push(sim);
-        logger.found(`🔥 ${sim.routeName} | profit=$${sim.profitAmount.toFixed(2)} | ROI=${sim.roiMultiplier.toFixed(0)}x`);
-      }
+  for (const route of routes) {
+    const sim = await simulateRouteWithRetry(route, inputAmount);
+    if (
+      sim && sim.profitable &&
+      sim.profitAmount  >= CONFIG.minProfitUsd &&
+      sim.roiMultiplier >= CONFIG.minRoiMultiplier
+    ) {
+      profitable.push(sim);
+      logger.found(`🔥 ${sim.routeName} | profit=$${sim.profitAmount.toFixed(2)} | ROI=${sim.roiMultiplier.toFixed(0)}x`);
     }
-
-    // Delay between batches
-    if (i + CONCURRENCY < routes.length) {
-      await new Promise(r => setTimeout(r, DELAY_MS));
-    }
+    if (DELAY_MS > 0) await new Promise(r => setTimeout(r, DELAY_MS));
   }
 
   profitable.sort((a, b) => b.profitAmount - a.profitAmount);
@@ -211,13 +199,15 @@ export async function scanAllRoutes(inputAmount, { maxHops, minTvl } = {}) {
 }
 
 // ── Simulate with retry on 429 ────────────────────────────────
-async function simulateRouteWithRetry(route, inputAmount, retries = 2) {
+async function simulateRouteWithRetry(route, inputAmount, retries = 3) {
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
       return await simulateRoute(route, inputAmount);
     } catch (e) {
       if (e?.response?.status === 429 && attempt < retries) {
-        await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
+        const wait = 2000 * (attempt + 1);
+        logger.warn(`Rate limited — waiting ${wait}ms before retry ${attempt + 1}/${retries}`);
+        await new Promise(r => setTimeout(r, wait));
         continue;
       }
       return null;
