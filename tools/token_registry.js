@@ -125,47 +125,30 @@ export async function fromRaw(rawAmount, mint) {
 // ── Register tokens from pool screening ───────────────────────
 // Called by scanner/agent when new pools are discovered
 export async function registerPoolTokens(pools) {
-  const unknown = [];
-
   for (const pool of pools) {
-    for (const mint of [pool.mintX, pool.mintY]) {
-      if (mint && !_tokenCache.has(mint)) {
-        unknown.push(mint);
-      }
+    // Fields mintX/mintY already normalized by normPool()
+    for (const side of ["X", "Y"]) {
+      const mint    = pool[`mint${side}`];
+      const symbol  = pool[`symbol${side}`];
+      const decimals = pool[`decimals${side}`];
+
+      if (!mint || _tokenCache.has(mint)) continue;
+
+      const meta = {
+        mint,
+        symbol:   symbol || mint.slice(0, 6),
+        name:     symbol || mint.slice(0, 6),
+        decimals: decimals ?? 6,
+        verified: pool[`verified${side}`] || false,
+        tags:     [],
+      };
+
+      _tokenCache.set(mint, meta);
+      if (symbol) _tokenCache.set(symbol, mint);
     }
   }
 
-  if (unknown.length === 0) return;
-
-  // Batch fetch from Jupiter token list
-  try {
-    const resp = await axios.get("https://tokens.jup.ag/tokens?tags=verified", { timeout: 8000 });
-    const allTokens = resp.data || [];
-    const byMint    = new Map(allTokens.map(t => [t.address, t]));
-
-    for (const mint of unknown) {
-      const t = byMint.get(mint);
-      if (t) {
-        const meta = {
-          mint:     t.address,
-          symbol:   t.symbol,
-          name:     t.name,
-          decimals: t.decimals,
-          tags:     t.tags || [],
-          verified: true,
-        };
-        _tokenCache.set(mint, meta);
-        _tokenCache.set(t.symbol, mint);
-      } else {
-        // Not in verified list — try individual fetch
-        await fetchTokenMeta(mint).catch(() => null);
-      }
-    }
-
-    logger.dim(`Token registry: ${_tokenCache.size} tokens cached (${unknown.length} new)`);
-  } catch (e) {
-    logger.warn(`registerPoolTokens batch fetch failed: ${e.message}`);
-  }
+  logger.dim(`Token registry: ${_tokenCache.size} tokens cached`);
 }
 
 // ── Get all known mints (for route building) ──────────────────
