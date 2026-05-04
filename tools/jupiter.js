@@ -8,6 +8,16 @@ import CONFIG from "../config.js";
 
 export { MINT_ADDRESSES } from "./token_registry.js";
 
+// Log API key status on module load
+setTimeout(() => {
+  const key = CONFIG.jupiterApiKey || process.env.JUPITER_API_KEY || "";
+  if (key) {
+    logger.info(`Jupiter API key loaded: ${key.slice(0, 8)}... (paid tier)`);
+  } else {
+    logger.warn("Jupiter API key not set — using free tier (rate limited)");
+  }
+}, 100);
+
 // ── Endpoints & headers ───────────────────────────────────────
 const JUPITER_ENDPOINTS = [
   "https://api.jup.ag/swap/v1",
@@ -15,9 +25,17 @@ const JUPITER_ENDPOINTS = [
 ];
 
 function getHeaders() {
-  return CONFIG.jupiterApiKey
-    ? { "x-api-key": CONFIG.jupiterApiKey }
-    : {};
+  // Read directly from process.env as fallback in case CONFIG not yet initialized
+  const key = CONFIG.jupiterApiKey || process.env.JUPITER_API_KEY || "";
+  if (key) {
+    return { "x-api-key": key };
+  }
+  return {};
+}
+
+function getDelay() {
+  const key = CONFIG.jupiterApiKey || process.env.JUPITER_API_KEY || "";
+  return key ? 50 : 600;
 }
 
 // ── Quote cache (TTL 30s) ─────────────────────────────────────
