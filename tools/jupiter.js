@@ -7,7 +7,45 @@ import { resolveMint, BASE_TOKENS, MINT_ADDRESSES } from "./token_registry.js";
 
 export { MINT_ADDRESSES } from "./token_registry.js";
 
-const JUPITER_API = "https://quote-api.jup.ag/v6";
+const JUPITER_ENDPOINTS = [
+  "https://api.jup.ag/swap/v1",
+  "https://lite-api.jup.ag/swap/v1",
+];
+
+let _activeEndpoint = JUPITER_ENDPOINTS[0];
+
+async function jupiterGet(path, params) {
+  for (const base of JUPITER_ENDPOINTS) {
+    try {
+      const resp = await axios.get(`${base}${path}`, { params, timeout: 8000 });
+      _activeEndpoint = base; // cache working endpoint
+      return resp;
+    } catch (e) {
+      if (e.code === "ENOTFOUND" || e.code === "ECONNREFUSED") {
+        logger.warn(`Jupiter endpoint unreachable: ${base} — trying next...`);
+        continue;
+      }
+      throw e; // other errors (4xx, 5xx) propagate normally
+    }
+  }
+  throw new Error("All Jupiter endpoints unreachable");
+}
+
+async function jupiterPost(path, body) {
+  for (const base of JUPITER_ENDPOINTS) {
+    try {
+      const resp = await axios.post(`${base}${path}`, body, { timeout: 15000 });
+      return resp;
+    } catch (e) {
+      if (e.code === "ENOTFOUND" || e.code === "ECONNREFUSED") {
+        logger.warn(`Jupiter endpoint unreachable: ${base} — trying next...`);
+        continue;
+      }
+      throw e;
+    }
+  }
+  throw new Error("All Jupiter endpoints unreachable");
+}
 
 // ── Get a swap quote from Jupiter ────────────────────────────
 export async function getJupiterQuote({
@@ -21,7 +59,7 @@ export async function getJupiterQuote({
     const inMint  = (await resolveMint(inputMint))  || inputMint;
     const outMint = (await resolveMint(outputMint)) || outputMint;
 
-    const params = new URLSearchParams({
+    const resp = await jupiterGet("/quote", {
       inputMint:  inMint,
       outputMint: outMint,
       amount:     amount.toString(),
@@ -30,9 +68,7 @@ export async function getJupiterQuote({
       restrictIntermediateTokens: "true",
     });
 
-    const resp = await axios.get(`${JUPITER_API}/quote?${params}`, { timeout: 5000 });
-    const q    = resp.data;
-
+    const q = resp.data;
     return {
       inputAmount:    parseInt(q.inAmount),
       outputAmount:   parseInt(q.outAmount),
@@ -50,15 +86,13 @@ export async function getJupiterQuote({
 // ── Get swap transaction from Jupiter ────────────────────────
 export async function getJupiterSwapTx(quote, userPublicKey, { wrapUnwrapSOL = true } = {}) {
   try {
-    const body = {
+    const resp = await jupiterPost("/swap", {
       quoteResponse:             quote.raw,
       userPublicKey,
       wrapAndUnwrapSol:          wrapUnwrapSOL,
       dynamicComputeUnitLimit:   true,
       prioritizationFeeLamports: "auto",
-    };
-
-    const resp = await axios.post(`${JUPITER_API}/swap`, body, { timeout: 10_000 });
+    });
     return resp.data.swapTransaction;
   } catch (e) {
     logger.error(`getJupiterSwapTx: ${e.message}`);
@@ -69,14 +103,21 @@ export async function getJupiterSwapTx(quote, userPublicKey, { wrapUnwrapSOL = t
 // ── Get USD price for any token ───────────────────────────────
 export async function getTokenPrice(mintAddr) {
   try {
-    const resp = await axios.get(
-      `https://price.jup.ag/v4/price?ids=${mintAddr}`,
-      { timeout: 3000 }
-    );
+    const resp = await jupiterGet("/price", { ids: mintAddr });
     const data = resp.data?.data?.[mintAddr];
     return data ? parseFloat(data.price) : null;
   } catch {
-    return null;
+    // Fallback: derive price from a USDC quote
+    try {
+      const quote = await getJupiterQuote({
+        inputMint:  mintAddr,
+        outputMint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        amount:     1_000_000,
+      });
+      return quote ? quote.outputAmount / 1e6 : null;
+    } catch {
+      return null;
+    }
   }
 }
 
