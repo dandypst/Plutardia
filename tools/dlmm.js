@@ -1,6 +1,6 @@
 // tools/dlmm.js — Meteora DLMM REST API wrapper (no SDK)
-// Base URL: https://dlmm.datapi.meteora.ag (per Meteora docs May 2026)
-// Swagger: https://dlmm.datapi.meteora.ag/swagger-ui/
+// Base URL: https://dlmm.datapi.meteora.ag
+// Field mapping based on actual API response structure
 
 import axios from "axios";
 import logger from "../logger.js";
@@ -8,29 +8,26 @@ import logger from "../logger.js";
 const BASE = "https://dlmm.datapi.meteora.ag";
 
 // ── Screen pools ──────────────────────────────────────────────
-export async function screenPools({ minTvl = 5000, limit = 50, sortBy = "volume" } = {}) {
+export async function screenPools({ minTvl = 5000, limit = 100, sortBy = "volume" } = {}) {
   try {
     const resp = await axios.get(`${BASE}/pools`, {
       params: {
-        limit,
-        sort_key:  sortBy === "volume" ? "trade_volume_24h"
-                 : sortBy === "fee"    ? "fees_24h"
-                 : "liquidity",
-        order_by: "desc",
+        page_size: Math.min(limit, 100), // API uses page_size not limit
+        page:      1,
+        sort_key:  sortBy === "fee" ? "fee" : "volume", // API sort keys
+        order_by:  "desc",
       },
       timeout: 10000,
     });
 
-    const raw = Array.isArray(resp.data)
-      ? resp.data
-      : (resp.data?.data || resp.data?.pools || []);
+    // Response shape: { total, pages, current_page, page_size, data: [...] }
+    const raw = resp.data?.data || [];
 
     const pools = raw
-      .filter(p => parseFloat(p.liquidity || p.tvl || 0) >= minTvl)
-      .slice(0, limit)
+      .filter(p => parseFloat(p.tvl || 0) >= minTvl)
       .map(normPool);
 
-    logger.dim(`screenPools: ${pools.length} pools returned`);
+    logger.dim(`screenPools: ${pools.length} pools (TVL≥$${minTvl}) from ${raw.length} returned`);
     return pools;
   } catch (e) {
     logger.error(`screenPools: ${e.message}`);
@@ -38,17 +35,27 @@ export async function screenPools({ minTvl = 5000, limit = 50, sortBy = "volume"
   }
 }
 
-// ── Normalize pool shape ──────────────────────────────────────
+// ── Normalize pool — maps actual API fields ───────────────────
 function normPool(p) {
   return {
-    address:   p.address   || p.pubkey || "",
-    name:      p.name      || `${(p.mint_x||"?").slice(0,4)}-${(p.mint_y||"?").slice(0,4)}`,
-    tvl:       parseFloat(p.liquidity        || p.tvl       || 0),
-    volume24h: parseFloat(p.trade_volume_24h || p.volume24h || 0),
-    fee24h:    parseFloat(p.fees_24h         || p.fee24h    || 0),
-    binStep:   p.bin_step  || p.binStep || 0,
-    mintX:     p.mint_x    || p.tokenXMint || "",
-    mintY:     p.mint_y    || p.tokenYMint || "",
+    address:   p.address || "",
+    name:      p.name    || "unknown",
+    tvl:       parseFloat(p.tvl || 0),
+    volume24h: parseFloat(p.volume?.["24h"] || p.trade_volume_24h || 0),
+    fee24h:    parseFloat(p.fee?.["24h"]    || p.fees_24h         || 0),
+    binStep:   p.pool_config?.bin_step || p.bin_step || 0,
+    // IMPORTANT: token info is nested under token_x / token_y
+    mintX:     p.token_x?.address || p.mint_x || "",
+    mintY:     p.token_y?.address || p.mint_y || "",
+    symbolX:   p.token_x?.symbol  || "",
+    symbolY:   p.token_y?.symbol  || "",
+    decimalsX: p.token_x?.decimals ?? 9,
+    decimalsY: p.token_y?.decimals ?? 6,
+    verifiedX: p.token_x?.is_verified || false,
+    verifiedY: p.token_y?.is_verified || false,
+    priceX:    parseFloat(p.token_x?.price || 0),
+    priceY:    parseFloat(p.token_y?.price || 0),
+    currentPrice: parseFloat(p.current_price || 0),
   };
 }
 
@@ -67,8 +74,11 @@ export async function getPoolMeta(poolAddress) {
 export async function getActiveBinPrice(poolAddress) {
   const meta = await getPoolMeta(poolAddress);
   if (!meta) return null;
-  const price = parseFloat(meta.current_price || meta.price || 0);
-  return { price, binId: meta.active_bin_id || null, rawPrice: price };
+  return {
+    price:    meta.currentPrice,
+    binId:    null,
+    rawPrice: meta.currentPrice,
+  };
 }
 
 // ── Simulate DLMM swap ────────────────────────────────────────
@@ -80,11 +90,11 @@ export async function simulateDlmmSwap(poolAddress, inputMint, inputAmountRaw, s
     });
     const d = resp.data;
     return {
-      inputAmount:  Number(d.in_amount         || inputAmountRaw),
-      outputAmount: Number(d.out_amount         || 0),
-      minOutput:    Number(d.min_out_amount      || 0),
-      priceImpact:  parseFloat(d.price_impact    || 0),
-      fee:          Number(d.fee                 || 0),
+      inputAmount:  Number(d.in_amount      || inputAmountRaw),
+      outputAmount: Number(d.out_amount      || 0),
+      minOutput:    Number(d.min_out_amount  || 0),
+      priceImpact:  parseFloat(d.price_impact || 0),
+      fee:          Number(d.fee             || 0),
     };
   } catch (e) {
     logger.error(`simulateDlmmSwap: ${e.message}`);
