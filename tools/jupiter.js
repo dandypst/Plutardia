@@ -14,21 +14,34 @@ const JUPITER_ENDPOINTS = [
 
 let _activeEndpoint = JUPITER_ENDPOINTS[0];
 
+// ── Simple quote cache (TTL 30s) to reduce API hammering ──────
+const _quoteCache   = new Map();
+const CACHE_TTL_MS  = 30_000;
+
+function cacheKey(inMint, outMint, amount) {
+  return `${inMint}:${outMint}:${amount}`;
+}
+
 async function jupiterGet(path, params, retries = 2) {
   for (const base of JUPITER_ENDPOINTS) {
     for (let attempt = 0; attempt <= retries; attempt++) {
       try {
-        const resp = await axios.get(`${base}${path}`, { params, timeout: 8000 });
+        const resp = await axios.get(`${base}${path}`, { params, timeout: 15000 });
         _activeEndpoint = base;
         return resp;
       } catch (e) {
         if (e.code === "ENOTFOUND" || e.code === "ECONNREFUSED") {
           logger.warn(`Jupiter endpoint unreachable: ${base} — trying next...`);
-          break; // try next endpoint
+          break;
         }
         if (e?.response?.status === 429 && attempt < retries) {
-          await new Promise(r => setTimeout(r, 500 * (attempt + 1)));
-          continue; // retry same endpoint
+          await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
+          continue;
+        }
+        if (e.code === "ECONNABORTED" && attempt < retries) {
+          // timeout — retry once with same endpoint
+          await new Promise(r => setTimeout(r, 500));
+          continue;
         }
         throw e;
       }
@@ -65,6 +78,13 @@ export async function getJupiterQuote({
     const inMint  = (await resolveMint(inputMint))  || inputMint;
     const outMint = (await resolveMint(outputMint)) || outputMint;
 
+    // Check cache
+    const key    = cacheKey(inMint, outMint, amount);
+    const cached = _quoteCache.get(key);
+    if (cached && Date.now() - cached.ts < CACHE_TTL_MS) {
+      return cached.data;
+    }
+
     const resp = await jupiterGet("/quote", {
       inputMint:  inMint,
       outputMint: outMint,
@@ -75,7 +95,7 @@ export async function getJupiterQuote({
     });
 
     const q = resp.data;
-    return {
+    const result = {
       inputAmount:    parseInt(q.inAmount),
       outputAmount:   parseInt(q.outAmount),
       minOutput:      parseInt(q.otherAmountThreshold),
@@ -83,6 +103,11 @@ export async function getJupiterQuote({
       routePlan:      q.routePlan || [],
       raw:            q,
     };
+
+    // Cache result
+    _quoteCache.set(key, { data: result, ts: Date.now() });
+
+    return result;
   } catch (e) {
     logger.error(`getJupiterQuote: ${e.message}`);
     return null;
