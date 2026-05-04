@@ -45,7 +45,7 @@ export const CONFIG = {
   jitoTipLamports:   userCfg.jitoTipLamports   ?? 100_000,  // Jito bundle tip
 
   // ─ Timing
-  scanIntervalMs:    userCfg.scanIntervalMs    ?? 2_000,    // How often to scan (ms)
+  scanIntervalMs:    userCfg.scanIntervalMs    ?? 30_000,   // 30s default — cukup untuk scan 3298 routes
   execTimeoutMs:     userCfg.execTimeoutMs     ?? 30_000,   // Tx confirmation timeout
 
   // ─ Pool screening (from Meridian)
