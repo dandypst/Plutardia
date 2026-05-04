@@ -11,7 +11,6 @@
     "status": "node get_status.js"
   },
   "dependencies": {
-    "@meteora-ag/dlmm": "latest",
     "@solana/web3.js": "^1.95.0",
     "@solana/spl-token": "^0.3.11",
     "bn.js": "^5.2.1",
